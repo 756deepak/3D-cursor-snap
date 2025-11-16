@@ -1,4 +1,4 @@
-# 3D-cursor-snap
+# Three-d-cursor-snap
 Hold Shift + RMB to drag the 3D cursor and snap it to a vertex, face, or edge in both Object Mode and Edit Mode.
 
 <img width="2560" height="1440" alt="Screenshot (25)" src="https://github.com/user-attachments/assets/3860ecc6-e277-4afc-95f0-c9a30eae866b" />
