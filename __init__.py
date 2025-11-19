@@ -1,9 +1,9 @@
-bl_info = {
+bl_info = { 
     "name": "Three d Cursor Snap",
     "author": "Deepak",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 5, 0),
-    "description": "3d cursor snap to vertex/edge/face.",
+    "description": "3d cursor snap to vertex/edge/face (with visibility).",
     "category": "3D View",
 }
 
@@ -11,10 +11,9 @@ import bpy
 import bpy_extras
 from mathutils import Vector
 
-
 VERTEX_RADIUS = 20
-EDGE_RADIUS   = 18
-FACE_RADIUS   = 30
+EDGE_RADIUS   = 25
+FACE_RADIUS   = 20
 
 
 def sdist(a, b):
@@ -22,7 +21,7 @@ def sdist(a, b):
 
 
 # ===========================================================
-#       FINAL ROBUST VISIBILITY (CONSISTENT CORNER SNAP)
+#               VISIBILITY CHECK (VERTEX)
 # ===========================================================
 def is_vertex_visible(context, vertex_world):
 
@@ -38,35 +37,55 @@ def is_vertex_visible(context, vertex_world):
 
     direction.normalize()
 
-    # ---- FIRST RAYCAST ----
-    hit, hit_loc, _, _, _, _ = context.scene.ray_cast(
-        deps, cam_origin, direction
-    )
-
+    hit, hit_loc, *_ = context.scene.ray_cast(deps, cam_origin, direction)
     if hit:
         dist_hit = (hit_loc - cam_origin).length
-
-        # blocked clearly
         if dist_hit < dist_to_vertex - 0.003:
             return False
-
-        # close = visible (numerical noise)
         if abs(dist_hit - dist_to_vertex) <= 0.01:
             return True
 
-    # ---- SECOND RAYCAST (offset origin) ----
-    # fixes corner + grazing angle misses
     offset_origin = cam_origin + direction * 0.02
-
-    hit2, hit_loc2, _, _, _, _ = context.scene.ray_cast(
-        deps, offset_origin, direction
-    )
-
+    hit2, hit_loc2, *_ = context.scene.ray_cast(deps, offset_origin, direction)
     if hit2:
         dist_hit2 = (hit_loc2 - offset_origin).length
         dist_vertex2 = (vertex_world - offset_origin).length
-
         if dist_hit2 < dist_vertex2 - 0.003:
+            return False
+
+    return True
+
+
+# ===========================================================
+#       VISIBILITY FOR ANY POINT (EDGE SAMPLE SUPPORT)
+# ===========================================================
+def is_point_visible(context, point_world):
+    deps = context.evaluated_depsgraph_get()
+    rv3d = context.region_data
+
+    cam_origin = rv3d.view_matrix.inverted().translation
+    direction = point_world - cam_origin
+    dist_to_point = direction.length
+
+    if dist_to_point == 0:
+        return True
+
+    direction.normalize()
+
+    hit, hit_loc, *_ = context.scene.ray_cast(deps, cam_origin, direction)
+    if hit:
+        dist_hit = (hit_loc - cam_origin).length
+        if dist_hit < dist_to_point - 0.003:
+            return False
+        if abs(dist_hit - dist_to_point) <= 0.01:
+            return True
+
+    offset_origin = cam_origin + direction * 0.02
+    hit2, hit_loc2, *_ = context.scene.ray_cast(deps, offset_origin, direction)
+    if hit2:
+        dist_hit2 = (hit_loc2 - offset_origin).length
+        dist_point2 = (point_world - offset_origin).length
+        if dist_hit2 < dist_point2 - 0.003:
             return False
 
     return True
@@ -94,9 +113,7 @@ def find_nearest_visible_vertex(context, mouse):
             if not is_vertex_visible(context, pw):
                 continue
 
-            ps = bpy_extras.view3d_utils.location_3d_to_region_2d(
-                region, rv3d, pw
-            )
+            ps = bpy_extras.view3d_utils.location_3d_to_region_2d(region, rv3d, pw)
             if ps is None:
                 continue
 
@@ -111,18 +128,15 @@ def find_nearest_visible_vertex(context, mouse):
 #                         RAYCAST
 # ===========================================================
 def evaluated_raycast(context, mouse):
+
     region = context.region
     rv3d   = context.region_data
     deps   = context.evaluated_depsgraph_get()
 
-    view = bpy_extras.view3d_utils.region_2d_to_vector_3d(
-        region, rv3d, mouse)
-    origin = bpy_extras.view3d_utils.region_2d_to_origin_3d(
-        region, rv3d, mouse)
+    view = bpy_extras.view3d_utils.region_2d_to_vector_3d(region, rv3d, mouse)
+    origin = bpy_extras.view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse)
 
-    hit, loc, normal, fi, obj, _ = context.scene.ray_cast(
-        deps, origin, view
-    )
+    hit, loc, normal, fi, obj, _ = context.scene.ray_cast(deps, origin, view)
 
     if hit:
         return True, loc, fi, obj
@@ -130,7 +144,7 @@ def evaluated_raycast(context, mouse):
 
 
 # ===========================================================
-#            EDGE MIDPOINT + FACE CENTER
+#  FINAL — EDGE MIDPOINT SNAP (with EDIT MODE FIX)
 # ===========================================================
 def edge_face_mid_snap(context, mouse):
 
@@ -143,40 +157,55 @@ def edge_face_mid_snap(context, mouse):
         return None
 
     obj_eval = obj.evaluated_get(deps)
-    mesh = obj_eval.to_mesh()
 
-    if face_idx >= len(mesh.polygons):
-        obj_eval.to_mesh_clear()
+    # ------------------------------
+    # FIX: edit mode uses obj.data
+    # ------------------------------
+    if obj.mode == 'EDIT':
+        mesh = obj.data
+    else:
+        mesh = obj_eval.data
+
+    if face_idx < 0 or face_idx >= len(mesh.polygons):
         return hit_loc
 
     poly = mesh.polygons[face_idx]
-    verts = poly.vertices[:]
+    loop_indices = list(poly.loop_indices)
+    verts = poly.vertices
+
     w = obj.matrix_world
     mouse_vec = Vector(mouse)
 
-    best_edge = (None, 999999)
+    best = (None, None, 999999)
+    sample_factors = (0.25, 0.5, 0.75)
 
-    # edge midpoints
-    for i in range(len(verts)):
-        v1 = w @ mesh.vertices[verts[i]].co
-        v2 = w @ mesh.vertices[(i+1) % len(verts)].co
+    for i, loop_idx in enumerate(loop_indices):
 
-        mid = (v1 + v2) * 0.5
+        v1 = w @ mesh.vertices[mesh.loops[loop_idx].vertex_index].co
+        next_loop = loop_indices[(i + 1) % len(loop_indices)]
+        v2 = w @ mesh.vertices[mesh.loops[next_loop].vertex_index].co
 
-        ms = bpy_extras.view3d_utils.location_3d_to_region_2d(
-            region, rv3d, mid
-        )
+        midpoint = (v1 + v2) * 0.5   # always snap to this
 
-        if ms:
-            d = sdist(ms, mouse_vec)
-            if d < best_edge[1]:
-                best_edge = (mid, d)
+        for f in sample_factors:
+            sample = v1.lerp(v2, f)
 
-    if best_edge[0] and best_edge[1] <= EDGE_RADIUS:
-        obj_eval.to_mesh_clear()
-        return best_edge[0]
+            if not is_point_visible(context, sample):
+                continue
 
-    # face center
+            ps = bpy_extras.view3d_utils.location_3d_to_region_2d(region, rv3d, sample)
+            if ps is None:
+                continue
+
+            d = sdist(ps, mouse_vec)
+
+            if d < best[2]:
+                best = (midpoint, sample, d)
+
+    if best[0] and best[2] <= EDGE_RADIUS:
+        return best[0]   # midpoint always
+
+    # ---------- FACE CENTER ----------
     fc = Vector((0,0,0))
     for vid in verts:
         fc += mesh.vertices[vid].co
@@ -184,12 +213,7 @@ def edge_face_mid_snap(context, mouse):
 
     fc_world = w @ fc
 
-    fs = bpy_extras.view3d_utils.location_3d_to_region_2d(
-        region, rv3d, fc_world
-    )
-
-    obj_eval.to_mesh_clear()
-
+    fs = bpy_extras.view3d_utils.location_3d_to_region_2d(region, rv3d, fc_world)
     if fs and sdist(fs, mouse_vec) <= FACE_RADIUS:
         return fc_world
 
@@ -237,9 +261,7 @@ def curve_snap(context, mouse):
             continue
 
         for p in curve_snap_points(obj, deps):
-            ps = bpy_extras.view3d_utils.location_3d_to_region_2d(
-                region, rv3d, p
-            )
+            ps = bpy_extras.view3d_utils.location_3d_to_region_2d(region, rv3d, p)
             if ps and sdist(ps, mouse) <= VERTEX_RADIUS:
                 return p
 
@@ -255,14 +277,10 @@ def free_space_point(context, mouse):
     rv3d   = context.region_data
     deps   = context.evaluated_depsgraph_get()
 
-    view = bpy_extras.view3d_utils.region_2d_to_vector_3d(
-        region, rv3d, mouse)
-    origin = bpy_extras.view3d_utils.region_2d_to_origin_3d(
-        region, rv3d, mouse)
+    view = bpy_extras.view3d_utils.region_2d_to_vector_3d(region, rv3d, mouse)
+    origin = bpy_extras.view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse)
 
-    hit, loc, *_ = context.scene.ray_cast(
-        deps, origin, view
-    )
+    hit, loc, *_ = context.scene.ray_cast(deps, origin, view)
     if hit:
         return loc
 
@@ -316,15 +334,13 @@ class CURSOR_OT_snap_drag(bpy.types.Operator):
                     overlay.wireframe_opacity = self.prev_opacity
 
             if not self.dragging:
-                place_cursor(context, (
-                    event.mouse_region_x, event.mouse_region_y))
+                place_cursor(context, (event.mouse_region_x, event.mouse_region_y))
 
             return {'FINISHED'}
 
         if event.type == "MOUSEMOVE":
             self.dragging = True
-            p = snap_point(context,
-                (event.mouse_region_x, event.mouse_region_y))
+            p = snap_point(context, (event.mouse_region_x, event.mouse_region_y))
             if p:
                 context.scene.cursor.location = p
 
