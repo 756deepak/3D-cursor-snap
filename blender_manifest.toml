@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "Three_d_Cursor_Snap"
-version = "1.0.0"
+version = "1.1.0"
 name = "Three d Cursor Snap"
 tagline = "Move 3d cursor like gizmo to snap vertex, edge and face"
 maintainer = "Deepak"
